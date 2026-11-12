@@ -1,53 +1,46 @@
-问题解答
-1. 提前切（precompute）时延会高吗？
+这个问题要查代码确认。先看音频增量机制和 forward 触发点：
 
-不会。两个原因：
+growing_mel 只是音频特征侧的增量（demo 路径）。看核心的 forward 触发和 KV cache 逻辑：
 
-量级差太远：音频前端（把波形过成特征）是轻量计算，一条几秒音频整条切完是毫秒级；而 LLM 的一次 forward 是几十亿参数的大矩阵运算。切分成本连零头都算不上。
-它不在关键路径上：预计算在 generate() 开始前一次性做完，而"首字延迟"是从第 0 拍到模型决定开口那拍（第 8 拍）的时间，由模型决策速度决定，不由切分决定。离线评测跑 7783 条时，提前切反而更快（避免边推理边重复切），还能保证和参考脚本 bit 一致。
-2. "一格小表格"是什么意思？
+音频侧确认了：每 240ms chunk ≈ 3 个音频 token，audio tower 有跨 session 批处理。现在确认 LLM 主干的 step 节奏和 KV 策略：
 
-LLM 的输入永远是一串 token 序列。这个模型每 240ms 被喂一小段固定格式的 token（一个 chunk），我把它比作"一格表格"：
+调度完全继承 vLLM V1（`super().schedule()`——KV cache 就是原生 PagedAttention）。再确认打断时的 KV 处理和 decode 节奏，闭环这个问题：
 
-格子	真实 token	作用
-开头标记
-<|chunk_bos|> <|audio_start|>
-告诉模型"新的一拍开始了"
-🔊 声音 ×3
-3 个 <|audio|> 占位符
-运行时被这拍的 3 行音频特征向量替换——这是模型真正"听到"的内容
-❓ 决策格
-<|agent_text_start|>
-模型在这个位置输出它这一拍的决定：听 / 说 / 被打断
-关键认知：模型不直接"说话"，它每拍先填这个格子，填了"说"才允许在后面追加一个词。
+worker.py:392 有 KV 回滚重算的关键注释，读完整段：
 
-3. "总说明"是什么？forward 是什么？有大小之分？
+"generation runs once per append" + context-roll 重算机制都找到了。查 roll 触发条件补全答案：
 
-总说明 = system prompt（角色设定/考试规则），编码成 token 放在整个序列最前面，只放一次，所有拍共享。就像试卷最上方的"注意事项"，每道题不用重印。
-forward = 把一段 token 完整过一遍神经网络，每个位置输出"下一个 token 最可能是什么"。这是模型计价的基本单位。
-大 vs 小：区别在于一次算的 token 数量。平时一拍只新增 13 个 token（小）；投机时把"前缀 + 5 张草稿"（几百几千 token）一次算（大）。一次算 65 个 token，远比"分 5 次、每次重算全部历史"便宜——这就是省钱的来源。
-4. "这个决定照样有效"——有效指什么？影响什么？
+全部查清了。回答你的两个问题：
 
-"有效"指这个预测能不能被信任、直接采用。逻辑链：
+## 大 forward 频次：每 240ms chunk 一次生成
 
-草稿假设的是"#8 在听"，这个假设只体现在决策格里预填的内容；
-而第 8 拍的预测，输入 = 已确认的 #0–7 + 第 8 拍自己的表格（3 格声音 + 决策格）——决策格是被预测的对象，不是它自己预测的输入；
-所以第 8 拍的预测完全不依赖那个错误的假设 → 有效。
-影响：#8 可以立刻按真实决定落账，一次都不用重算；只有 #9 及之后作废。这就是"猜错不亏"的精确含义——已省下的 forward 白赚，转折拍零浪费。
-5. 为什么说话每个词都依赖前一个，而"听"可以批量？
+协议层强制（`runtime.py:189`）：*"each duplex append must contain exactly one 240 ms chunk; **generation runs once per append**"*——**音频每来 240ms，触发一次生成**。
 
-文本是自回归的：第 N 个词的概率分布条件在前 N−1 个词上。"I'm sorry, but I ___" 下一个词填什么，强烈依赖前面选了哪些词。所以第 10 拍的词必须先知道第 9 拍选了什么 → 无法预先排好，只能逐词来。
-听拍不产生新内容：听拍要填的决策格高度可预测（大概率继续听），而且草稿的"原材料"（音频组）是外部输入、与模型的选择无关——不是模型自己生成的。所以可以先摆 K 拍草稿、事后核对意图，核对不上就截断，没有连锁反应。
-一句话：听拍的输入是确定的，说拍的输入是模型自己刚生成的——前者能预排，后者不能。
+这一次“生成”内部的结构（以一个 chunk 为单位）：
 
-6. "挂电话"是什么？8 拍是监测吗？
+| 组成 | forward 次数 | 说明 |
+|---|---|---|
+| 音频增量 prefill | 1 次 | 新 chunk 的 ~3 个音频 token（13Hz mel → 240ms ≈ 3 帧）+ replay/封口结构 token，作为增量 append |
+| agent token decode | 每 token 1 次 | legacy 每 chunk 恰 1 个 agent token；state_then_text 最多 3 个（span 内自回归，每 token 一次 decode forward） |
+| audio tower | 1 次小 forward（3 帧） | 与 LLM 主干分开；有跨 session 批处理（`VLLM_OMNI_DUPLEX_TOWER_BATCH`，把所有 session 的 tower 工作攒成一个 batch，省掉逐 session 串行的 30-35ms） |
 
-挂电话 = generate() 函数返回：这条音频的推理结束，写 contract 交卷。不是"不听"，是整个程序停。
-8 拍 = 停止条件的阈值（演示版；真实是 21 拍 ≈ 5 秒）。规则是：连续安静 ≥ 8 拍 且 当前没有说到一半的回答 → 判定这轮对话结束。是的，沉默 8 拍就视为"这轮聊完了"。
-为什么不音频一停就挂：①训练时模型每拍都有音频输入，突然断供等于给它一个没见过的状态（OOD）；②真实对话里人说完会停顿，得等一等看对方是否还有下文。
-9. "投机 14 vs 老实 21，3~8 倍"怎么理解？
+所以纯听（listen）的 chunk = 1 次小 prefill + 状态判断；说话的 chunk = 1 次小 prefill + 1~3 次 decode。引擎层面所有 session 的 prefill/decode 混在一个 batch step 里（vLLM V1 混合批，`super().schedule()` 原生调度）。
 
-这次演示：投机版共 14 次 forward（3 次大 forward 覆盖听/陪跑拍 + 11 次逐拍说话），老实版每拍 1 次共 21 次 → 省 33%。
-演示的听段被压得很短。真实案例里听段有 23+ 拍，且真实 K 上限是 64（一次能赌 64 拍）——听段越长，一次大 forward 覆盖的拍数越多，省得越多。
-还有第二层更狠的差距：老实办法每拍都重算全部历史（第 100 拍要重算 100 拍的 token，越往后单次越贵）；投机版大 forward 只算一次，逐拍阶段也只算新增 token。所以差距不只在次数，还在每次的成本。
-两个效果叠加 → 真实整体快 3~8 倍（80s → 10s/条）。
+## KV cache：正常全复用，定期有一笔“滚动重算”
+
+**正常路径（99% 的 chunk）**：完整走 vLLM 原生 PagedAttention——每 chunk 只是增量 append（`token_offset > 0` = "normal append to an already-prefilled prompt"，`worker.py:405`），`num_computed_tokens` 累计，历史 KV 块一个都不重算。
+
+**例外：context roll（整窗重算）**——这是唯一丢 KV 的场景：
+
+- 触发条件（`omni_ar_scheduler.py:1115-1140` `_maybe_roll_duplex_context`）：会话 chunk 数超过 `context_chunk_length + roll_batch + 1`
+- 默认窗口 **300 chunks**（= 300 × 240ms ≈ **72 秒**音频上下文）+ 攒批 20（`serving_adapter.py:458`）——即**约每 321 个 chunk（77 秒）才触发一次**
+- 触发时：prompt 裁剪成 `chunk0（system prompt + 首 chunk）+ 最近 300 chunks`，**`num_computed_tokens=0`，旧 KV blocks 释放，整个保留窗口重 prefill**（约 900-1500 token 量级的一次大 forward）
+- 目的：防 `prompt_token_ids` 无限增长撑爆 `max_model_len`、限制注意力开销
+
+**摊销账**：72 秒音频才付一次 ~1000 token 的重 prefill，平摊到每个 chunk 是 ~3 个 token 的额外 prefill 开销，相对每 chunk 本来就要做的增量 append（~3 音频 token + 结构 token），翻倍但不到一个量级。
+
+<options>
+    <option>看 CHUNK_LAYOUT.md 的序列结构文档（roll 机制有专门章节）</option>
+    <option>算一算实际评测时的 forward/token 吞吐对账</option>
+    <option>清楚了</option>
+</options>
